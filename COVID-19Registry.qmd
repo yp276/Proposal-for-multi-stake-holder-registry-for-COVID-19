@@ -1,0 +1,336 @@
+---
+title: "Proposal for multi-stake holder registry for COVID-19"
+format: html
+embed-resources: true
+---
+
+# Name: Yuktha Penumala 
+```{r}
+#| warning: false
+library(tidyverse)     # loads the tidyverse tools
+library(RPostgres)     # loads the database driver for PostgreSQL
+library(connections)   # helps RPostgres work with RStudio
+library(keyring)       # access to a local encrypted keychain for passwords
+
+con <- connection_open(RPostgres::Postgres(),
+          dbname = "syntheticMGUH",
+          host = "...", 
+          user = "...", 
+          password = key_get(service = "...", 
+                             username = "..."),
+          bigint = "numeric")
+```
+
+# Introduction:  
+In efforts to improve clinical care, MedStar Georgetown University Hospital(MGUH), Sibley, and George Washington(GW) are forming a strategic partnership to create a COVID-19 Registry. The purpose of this registry is to consolidate all of the vast COVID-19 data in a singular and accessible platform, which supports exchange of patient information and public health reporting. 
+
+Each of these hospitals use a different EMR system, with MGUH using Cerner, Sibley using Epic, and GW using MEDITECH. 
+
+# Patient Selection: 
+
+The target population is COVID-19 patients, however, there are multiple identifiers for COVID-19. First, it's imperative to look at Encounters tables, and count all unique encounters reported for COVID-19 (explicitly as COVID-19 or SARS). It's reported that there are a total of 1,322 COVID-19 encounters, excluding Suspected COVID-19. 
+
+```{sql connection=con}
+/*Patient selection via Encounters*/
+SELECT code, reasondescription,
+  COUNT(id) AS encounters, 
+  COUNT(DISTINCT patient) as patients
+FROM encounters
+WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+GROUP BY code, reasondescription
+```
+
+However, there are also many patients who didn't schedule an appointment/visit for COVID-19 symptoms, but instead directly went to the hospital/outpatient clinic lab to get tested. Therefore, it's crucial to count all the COVID-19 positive patients, and likewise, the positive rate from the Observations database. Similar to the Encounters table, it's important to filter by both the disease (COVID-19) and virus (SARS-CoV-2). 
+```{sql connection=con}
+/* First, look at table structure to determine how values are defined*/ 
+  SELECT DISTINCT code, description, value
+  FROM observations 
+  WHERE description like '%SARS%' or description LIKE '%COVID%'
+```
+
+By looking at the table structure, it was identified that positive COVID-19 tests reported a value of "Detected (qualifier value)". Thus, you count the total number of positive tests and positive rate when the value = "Detected (qualifer value)" and where the code = 94531-1 (maps to SARS-CoV-2 RNA Pnl Resp NAA+probe). It's reported that there are 4,802 positive COVID-19 tests and a positive rate of 73.6%. 
+```{sql connection=con}
+/* Patient selection via Observations*/   
+  SELECT COUNT(*) as total_tests, 
+         SUM(CASE WHEN value = 'Detected (qualifier value)' THEN 1 ELSE 0 END) AS positives,
+         SUM(CASE WHEN value = 'Detected (qualifier value)' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as positive_rate
+  FROM observations 
+  WHERE code = '94531-1' 
+```
+
+Moreover, another COVID-19 identifier is a medical problem/condition. It's reported that the code used for COVID-19 is 840539006, while 840544004 is used for Suspected COVID-19, however, the second code will be excluded to only report officially diagnosed COVID-19 patients. It's reported that there are a total of 4,660 COVID-19 diagnoses (conditions). 
+```{sql connection=con}
+/*First, look at table structure to know what code is used for COVID-19.*/ 
+  SELECT DISTINCT description, code
+    FROM conditions 
+    WHERE description LIKE '%COVID%' or description LIKE '%SARS%'
+```
+
+```{sql connection = con}
+/* Patient selection via Observations*/   
+ SELECT COUNT(DISTINCT patient)
+    FROM conditions 
+    WHERE code = '840539006' 
+```
+
+All together, you can now merge all identifiers into a singular table. To do so, you create a CTE and join them together using a UNION SELECT. 
+```{sql connection=con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+)
+SELECT *
+FROM covid_population_mrns
+```
+
+You now have a single table with all the COVID-19 patients, identified via unique patient IDs.
+
+## Additional Patient Information:
+Next, you want to select additional information, aside from patient IDs, to capture the true patient profile. These data points include: diagnosis time (year and month), age, gender, race, and zipcode. 
+
+The diagnosis time is important to identify monthly and yearly trends of COVID-19 infection rates, such as to see which month has highest rates or lowest rates. To do so, you first create a new CTE (covid_diagnosis_time) and pull information from the Conditions table where you extract both the year and month from the 'Start' column. To ensure that the diagnosis time matches with another database, you can join on the 'Start' column. 
+
+Then, you create another CTE (covid_population_demographics) and from the "main" CTE (covid_population_mrns) you collect other demographical patient information such as gender, ethnicity, zipcode, and birthdate. The first three data points are imperative to overall understand most/least affected gender, race, and zicpode/area by COVID-19. However, in order to collect these data points, you need to join this new CTE (covid_population_demographics) with this additional information from the Patients table. 
+
+Moreover, to report the ages of COVID-19 patients, you calculate the age from the 'birthdate' column in the covid_population_demographics CTE. You perform the age calculation in the main query. You use the Extract() function to collect the year component from the difference between the current date and the patient's birthdate. 
+
+Also, in the main query, you select the demograpical information of COVID-19 patients (gender, race, zipcode, diagnosis year, diagnosis month) from the covid_population_demographics CTE. Finally, you perform a left join on the covid_diagnosis_time CTE, so to consolidate information only on COVID-19 patients. 
+
+Here is a single table, which shows all the specified information on the COVID-19 patients. 
+
+```{sql connection = con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+),
+covid_diagnosis_time AS (
+SELECT 
+  extract(year from conditions.start) AS diagnosis_year, 
+  extract (month from conditions.start) AS diagnosis_month, 
+  conditions.patient
+FROM conditions
+INNER JOIN encounters on encounters.start = conditions.start
+GROUP BY diagnosis_year, diagnosis_month, conditions.patient
+),
+covid_population_demographics AS (
+  SELECT patient, gender, race, zip, birthdate  
+  FROM covid_population_mrns 
+    LEFT JOIN patients ON patient = patients.id
+)
+SELECT
+  cpd.patient, cpd.gender, cpd.race, cpd.zip,
+  cdt.diagnosis_year, cdt.diagnosis_month,
+  EXTRACT(YEAR FROM AGE(CURRENT_DATE, cpd.birthdate)) AS age
+FROM covid_population_demographics cpd
+LEFT JOIN covid_diagnosis_time cdt
+ON cpd.patient = cdt.patient
+```
+
+## Analysis as a single data set 
+To ensure that the data from all 3 hospitals is analyzed as a single dataset, you can look at average age, gender proportion, race breakdown, and zipcode breakdown from the current table of consolidated COVID-19 patient information. Please note, the numbers reported for each analysis may not be accurate due to slight errors in calculations, but the same logic/code can be used to do the analysis. 
+
+# Average age of a patient at diagnosis 
+To find the average age of COVID-19 patient, you extract the "main" CTE (covid_population_mrns) and the covid population demographics CTE. Then, in the main query, you use the Avg() function, along with the Extract() function to find the difference between the current date and each patient's birthdate and then computing the average.
+
+It's reported that the average age (at diagnosis) is ~36/37, so most affected age demogprahic is middle-age.
+
+```{sql connection = con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+),
+covid_population_demographics AS (
+  SELECT patient, birthdate  
+  FROM covid_population_mrns 
+    LEFT JOIN patients ON patient = patients.id
+)
+SELECT AVG(EXTRACT(YEAR FROM AGE(CURRENT_DATE, birthdate))) AS average_age
+FROM covid_population_demographics
+```
+
+# Gender proportion
+To find the gender proportion of COVID-19, you extract the "main" CTE (covid_population_mrns) and the covid population demographics CTE. Then, in the main query, you use the Count() function to calculate the breakdown of COVID-19 among females and males. It's reported that there are 2,595	females and 2,346	males, which is only a small margin of difference. Thus, it's safe to generalize that COVID-19 doesn't affect one gender more than the other. 
+
+```{sql connection = con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+),
+covid_population_demographics AS (
+  SELECT patient, gender
+  FROM covid_population_mrns 
+    LEFT JOIN patients ON patient = patients.id
+)
+SELECT gender, COUNT(*) AS gender_count
+FROM covid_population_demographics
+GROUP by gender
+```
+
+# Race breakdown
+To find the race breakdown of COVID-19, you extract the "main" CTE (covid_population_mrns) and the covid population demographics CTE. Then, in the main query, you use the count function to calculate the breakdown of COVID-19 among races and arrange it in descending order. It's reported that Blacks and Native Americans are the most and least affected by COVID-19, having 2,396 patients and 25 patients, respectively.
+
+```{sql connection = con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+),
+covid_population_demographics AS (
+  SELECT patient, race
+  FROM covid_population_mrns 
+    LEFT JOIN patients ON patient = patients.id
+)
+SELECT race, COUNT(*) AS race_count
+FROM covid_population_demographics
+GROUP BY race
+ORDER BY race_count DESC
+```
+
+# Zipcode breakdown
+To find the zipcode breakdown of COVID-19, you extract the "main" CTE (covid_population_mrns) and the covid population demographics CTE. Then, in the main query, you use the count function to calculate the breakdown of COVID-19 among zipcodes and arrange it in descending order. It's reported that 20018	is the zipcode with the highest COVID-19 patients.
+
+```{sql connection = con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+),
+covid_population_demographics AS (
+  SELECT patient, zip
+  FROM covid_population_mrns 
+    LEFT JOIN patients ON patient = patients.id
+)
+SELECT zip, COUNT(*) AS zip_count
+FROM covid_population_demographics
+GROUP BY zip
+ORDER BY zip_count DESC
+```
+
+## Outcomes
+The COVID-19 pandemic has resulted in widespread morbidity and mortality with the consequences expected to be felt for many years. Since COVID-19 is still a prevalent issue, it's imperative to measure outcomes to assess the treatments and overall improve the quality and delivery of care to patients with COVID-19. 
+
+# Death count 
+One outcome to assess is the death count. Death count is a good outcome to measure because it captures the true mortality of COVID-19. Also, by measuring death count, you can identify trends and analyze whether there's an increase or decrease in deaths based on a surge, new treatment, and more. 
+
+To find the death count (total deaths) of COVID-19, you extract the "main" CTE (covid_population_mrns) and the covid population demographics CTE, in which you select Deathdate column. Then, in the main query, you use the count function to calculate the deathcount and factor out null values. Please note, due to the storage capacity of Rstudio, the true COVID-19 death count isn't reported, but the same logic/code can be used to do so. 
+```{sql connection=con}
+WITH covid_population_mrns AS (
+  SELECT patient
+    FROM encounters
+    WHERE reasondescription like '%COVID%' or reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+    FROM observations 
+    WHERE code = '94531-1' 
+      AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+    FROM conditions WHERE code = '840539006' -- COVID-19 
+      AND description LIKE '%COVID%' or description LIKE '%SARS%'
+),
+covid_population_demographics AS (
+  SELECT patient, deathdate
+  FROM covid_population_mrns 
+    LEFT JOIN patients ON patient = patients.id
+)
+SELECT COUNT(*) AS death_count
+FROM covid_population_demographics
+WHERE deathdate IS NOT NULL
+```
+
+# Length of stay
+During the peak of the COVID-19 pandemic, there was an influx of patients while efflux of resources such as beds and ventilators in hospitals. Thus, it's imperative to measure the length of stay for COVID-19 patients since it serves as a strong indicator of both medical and financial efficiency such as planning resource allocation. 
+
+To find the length of stay, you first extract the "main" CTE (covid_population_mrns). Then, you create a second CTE (length_of_stay), where you select the Start and Stop columns from the Encounters table since these will be used to calculate the length of stay. Specifically, you perform data type conversions, casting the start and stop columns to a date data type. You join length_of_stay to the covid_population_mrns table on patient ID. After, in the main query, you calculate the total length of stays (in days) by using Sum() function, which adds up the differences in days for each COVID-19 patient. You then arrange the total_length_of_stay_in_days in descending order, where it's reported that the longest length of stay for COVID-19 was 321 days. 
+Please note, the true total_length_of_stay_in_days may not be captured accurately as the numbers could be slightly skewed due to error, however, similar logic/code can be used to calculate this outcome. 
+
+```{sql connection = con}
+WITH covid_population_mrns AS (
+  SELECT patient
+  FROM encounters
+  WHERE reasondescription LIKE '%COVID%' OR reasondescription LIKE '%SARS%'
+  UNION
+  SELECT patient
+  FROM observations 
+  WHERE code = '94531-1' 
+    AND value = 'Detected (qualifier value)'
+  UNION
+  SELECT patient
+  FROM conditions 
+  WHERE code = '840539006' -- COVID-19 
+    AND description LIKE '%COVID%' OR description LIKE '%SARS%'
+),
+length_of_stay AS (
+  SELECT
+    e.patient,
+    e.encounterclass,
+    e.start::date AS encounter_start,
+    e.stop::date AS encounter_stop
+  FROM encounters e
+  JOIN covid_population_mrns cpm ON e.patient = cpm.patient
+)
+SELECT
+  patient,
+  SUM((encounter_stop - encounter_start)::int) AS total_length_of_stay_in_days
+FROM length_of_stay
+GROUP BY patient
+ORDER BY total_length_of_stay_in_days DESC
+```
